@@ -2,9 +2,12 @@ package main
 
 import (
 	"flag"
+	"github.com/cnlh/nps/lib/install"
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 
 	"github.com/astaxie/beego"
 	"github.com/astaxie/beego/logs"
@@ -12,35 +15,24 @@ import (
 	"github.com/cnlh/nps/lib/crypt"
 	"github.com/cnlh/nps/lib/daemon"
 	"github.com/cnlh/nps/lib/file"
-	"github.com/cnlh/nps/lib/install"
 	"github.com/cnlh/nps/lib/version"
 	"github.com/cnlh/nps/server"
 	"github.com/cnlh/nps/server/connection"
-	"github.com/cnlh/nps/server/test"
 	"github.com/cnlh/nps/server/tool"
-	_ "github.com/cnlh/nps/web/routers"
+
+	"github.com/cnlh/nps/web/routers"
+	"github.com/kardianos/service"
 )
 
 var (
-	level   string
-	logType = flag.String("log", "stdout", "Log output mode（stdout|file）")
+	level string
 )
 
 func main() {
 	flag.Parse()
-	beego.LoadAppConfig("ini", filepath.Join(common.GetRunPath(), "conf", "nps.conf"))
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "test":
-			test.TestServerConfig()
-			log.Println("test ok, no error")
-			return
-		case "start", "restart", "stop", "status", "reload":
-			daemon.InitDaemon("nps", common.GetRunPath(), common.GetTmpPath())
-		case "install":
-			install.InstallNps()
-			return
-		}
+	// init log
+	if err := beego.LoadAppConfig("ini", filepath.Join(common.GetRunPath(), "conf", "nps.conf")); err != nil {
+		log.Fatalln("load config file error", err.Error())
 	}
 	if level = beego.AppConfig.String("log_level"); level == "" {
 		level = "7"
@@ -48,11 +40,106 @@ func main() {
 	logs.Reset()
 	logs.EnableFuncCallDepth(true)
 	logs.SetLogFuncCallDepth(3)
-	if *logType == "stdout" {
-		logs.SetLogger(logs.AdapterConsole, `{"level":`+level+`,"color":true}`)
-	} else {
-		logs.SetLogger(logs.AdapterFile, `{"level":`+level+`,"filename":"`+beego.AppConfig.String("log_path")+`","daily":false,"maxlines":100000,"color":true}`)
+	logPath := beego.AppConfig.String("log_path")
+	if logPath == "" {
+		logPath = common.GetLogPath()
 	}
+	if common.IsWindows() {
+		logPath = strings.Replace(logPath, "\\", "\\\\", -1)
+	}
+	// init service
+	options := make(service.KeyValue)
+	options["Restart"] = "on-success"
+	options["SuccessExitStatus"] = "1 2 8 SIGKILL"
+	svcConfig := &service.Config{
+		Name:        "Nps",
+		DisplayName: "nps内网穿透代理服务器",
+		Description: "一款轻量级、功能强大的内网穿透代理服务器。支持tcp、udp流量转发，支持内网http代理、内网socks5代理，同时支持snappy压缩、站点保护、加密传输、多路复用、header修改等。支持web图形化管理，集成多用户模式。",
+		Option:      options,
+	}
+	svcConfig.Arguments = append(svcConfig.Arguments, "service")
+	if len(os.Args) > 1 && os.Args[1] == "service" {
+		logs.SetLogger(logs.AdapterFile, `{"level":`+level+`,"filename":"`+logPath+`","daily":false,"maxlines":100000,"color":true}`)
+	} else {
+		logs.SetLogger(logs.AdapterConsole, `{"level":`+level+`,"color":true}`)
+	}
+	if !common.IsWindows() {
+		svcConfig.Dependencies = []string{
+			"Requires=network.target",
+			"After=network-online.target syslog.target"}
+	}
+	prg := &nps{}
+	prg.exit = make(chan struct{})
+	s, err := service.New(prg, svcConfig)
+	if err != nil {
+		logs.Error(err)
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] != "service" {
+		switch os.Args[1] {
+		case "reload":
+			daemon.InitDaemon("nps", common.GetRunPath(), common.GetTmpPath())
+			return
+		case "install":
+			// uninstall before
+			service.Control(s, "stop")
+			service.Control(s, "uninstall")
+
+			binPath := install.InstallNps()
+			svcConfig.Executable = binPath
+			s, err := service.New(prg, svcConfig)
+			if err != nil {
+				logs.Error(err)
+				return
+			}
+			err = service.Control(s, os.Args[1])
+			if err != nil {
+				logs.Error("Valid actions: %q\n", service.ControlAction, err.Error())
+			}
+			return
+		case "start", "restart", "stop", "uninstall":
+			err := service.Control(s, os.Args[1])
+			if err != nil {
+				logs.Error("Valid actions: %q\n", service.ControlAction, err.Error())
+			}
+			return
+		case "update":
+			install.UpdateNps()
+			return
+		default:
+			logs.Error("command is not support")
+			return
+		}
+	}
+	s.Run()
+}
+
+type nps struct {
+	exit chan struct{}
+}
+
+func (p *nps) Start(s service.Service) error {
+	p.run()
+	return nil
+}
+func (p *nps) Stop(s service.Service) error {
+	close(p.exit)
+	if service.Interactive() {
+		os.Exit(0)
+	}
+	return nil
+}
+
+func (p *nps) run() error {
+	defer func() {
+		if err := recover(); err != nil {
+			const size = 64 << 10
+			buf := make([]byte, size)
+			buf = buf[:runtime.Stack(buf, false)]
+			logs.Warning("nps: panic serving %v: %v\n%s", err, string(buf))
+		}
+	}()
+	routers.Init()
 	task := &file.Tunnel{
 		Mode: "webServer",
 	}
@@ -61,10 +148,15 @@ func main() {
 		logs.Error("Getting bridge_port error", err)
 		os.Exit(0)
 	}
-	logs.Info("the version of server is %s ,allow client version to be %s", version.VERSION, version.GetVersion())
+	logs.Info("the version of server is %s ,allow client core version to be %s", version.VERSION, version.GetVersion())
 	connection.InitConnectionService()
 	crypt.InitTls(filepath.Join(common.GetRunPath(), "conf", "server.pem"), filepath.Join(common.GetRunPath(), "conf", "server.key"))
 	tool.InitAllowPort()
 	tool.StartSystemInfo()
-	server.StartNewServer(bridgePort, task, beego.AppConfig.String("bridge_type"))
+	go server.StartNewServer(bridgePort, task, beego.AppConfig.String("bridge_type"))
+	select {
+	case <-p.exit:
+		logs.Warning("stop...")
+	}
+	return nil
 }
